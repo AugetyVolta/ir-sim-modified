@@ -399,50 +399,94 @@ class ObjectBase:
         """reset the id iterator"""
         cls.id_iter = itertools.count(start, step)
 
+    # def step(
+    #     self,
+    #     velocity: Optional[np.ndarray] = None,
+    #     sensor_step: bool = True,
+    #     **kwargs: Any,
+    # ):
+    #     """
+    #     Perform a single simulation step, updating the object's state and sensors.
+
+    #     This method advances the object by one time step, integrating the given velocity
+    #     or behavior-generated velocity to update the object's position, orientation, and
+    #     other state variables. It also updates sensors and checks for collisions.
+
+    #     Args:
+    #         velocity (np.ndarray, optional): Desired velocity for this step.
+    #             If None, the object will use its behavior system to generate velocity.
+    #             The shape and meaning depend on the kinematics model:
+
+    #             - Differential: [linear_velocity, angular_velocity]
+    #             - Omnidirectional: [velocity_x, velocity_y]
+    #             - Ackermann: [linear_velocity, steering_angle]
+
+    #         **kwargs: Additional parameters passed to behavior generation and processing.
+
+    #     Returns:
+    #         np.ndarray: The updated state vector of the object after the step.
+    #         Returns the current state unchanged if the object is static or stopped.
+
+    #     Note:
+    #         - Static objects (static=True) will not move and return their current state
+    #         - Objects with stop_flag=True will halt and return their current state
+    #         - The method automatically handles sensor updates and trajectory recording
+    #     """
+
+    #     if self.static or self.stop_flag:
+    #         self._velocity = np.zeros(self.vel_shape)
+    #         return self.state
+    #     self.pre_process()
+    #     behavior_vel = self.gen_behavior_vel(velocity)
+    #     new_state = self.kf.step(self.state, behavior_vel, world_param.step_time)
+    #     next_state = self.mid_process(new_state)
+
+    #     self._state = next_state
+    #     self._velocity = behavior_vel
+    #     self._geometry = self.gf.step(self.state)
+
+    #     if sensor_step:
+    #         self.sensor_step()
+
+    #     self.post_process()
+    #     self.trajectory.append(self.state.copy())
+    #     return next_state
+    
     def step(
         self,
-        velocity: Optional[np.ndarray] = None,
+        step: Optional[np.ndarray] = None,
         sensor_step: bool = True,
         **kwargs: Any,
     ):
-        """
-        Perform a single simulation step, updating the object's state and sensors.
-
-        This method advances the object by one time step, integrating the given velocity
-        or behavior-generated velocity to update the object's position, orientation, and
-        other state variables. It also updates sensors and checks for collisions.
-
-        Args:
-            velocity (np.ndarray, optional): Desired velocity for this step.
-                If None, the object will use its behavior system to generate velocity.
-                The shape and meaning depend on the kinematics model:
-
-                - Differential: [linear_velocity, angular_velocity]
-                - Omnidirectional: [velocity_x, velocity_y]
-                - Ackermann: [linear_velocity, steering_angle]
-
-            **kwargs: Additional parameters passed to behavior generation and processing.
-
-        Returns:
-            np.ndarray: The updated state vector of the object after the step.
-            Returns the current state unchanged if the object is static or stopped.
-
-        Note:
-            - Static objects (static=True) will not move and return their current state
-            - Objects with stop_flag=True will halt and return their current state
-            - The method automatically handles sensor updates and trajectory recording
-        """
-
         if self.static or self.stop_flag:
             self._velocity = np.zeros(self.vel_shape)
             return self.state
+
         self.pre_process()
-        behavior_vel = self.gen_behavior_vel(velocity)
-        new_state = self.kf.step(self.state, behavior_vel, world_param.step_time)
+
+        if step is None:
+            # 没有输入就保持不动
+            step = np.zeros_like(self.state)
+
+        else:
+            # 先转成 numpy，方便判断形状
+            arr = np.asarray(step, dtype=float)
+
+            # 情况 1: [[x], [y]] 这种 2×1 列向量，补成 [[x], [y], [0]]
+            if arr.shape == (2, 1):
+                arr = np.vstack([arr, [[0.0]]])
+
+            # 可选扩展: 如果是 [x, y] 这种一维长度为 2 的输入，也补一个 0 变成 3×1
+            elif arr.shape == (2,):
+                arr = np.array([[arr[0]], [arr[1]], [0.0]], dtype=float)
+
+            # 最后做一次形状检查，必须和 state 一致
+            step = to_numpy(arr, expected_shape=self.state.shape)
+
+        new_state = self.state + step
         next_state = self.mid_process(new_state)
 
         self._state = next_state
-        self._velocity = behavior_vel
         self._geometry = self.gf.step(self.state)
 
         if sensor_step:
@@ -865,6 +909,97 @@ class ObjectBase:
             deque_goals.append(goal)
 
         self.set_goal(deque_goals, init=init)
+    
+    def get_random_free_position(
+            self,
+            object_list,
+            free: bool = True,
+            filter_goal: bool = False,
+            check_radius: float = 0.2,
+            range_limits: Optional[list] = None,
+            max_attempts: int = 200,
+        ):
+            """
+            在环境中随机采样无碰撞的位置，可作为起点或终点。
+
+            功能说明：
+            - 做几何碰撞检测（可选）；
+            - 可选对其他机器人的目标点做最小距离约束；
+            - 返回单个无碰撞位置。
+
+            参数：
+                object_list:
+                    环境中的对象列表（障碍物、其他机器人等）。
+                free:
+                    若为 True，则位置必须在空闲区域内（不与 object_list 中任意对象几何相交）。
+                filter_goal:
+                    若为 True，则位置需与其他机器人的目标点保持一定最小距离。
+                check_radius:
+                    碰撞检测半径，同时作为与其他机器人目标点的最小距离阈值基准。
+                range_limits:
+                    采样范围 [[x_min, y_min, ...], [x_max, y_max, ...]]；
+                    若为 None，使用 self.rl, self.rh。
+                max_attempts:
+                    采样最大尝试次数。
+
+            返回：
+                position:
+                    单个无碰撞的位置（格式与 random_point_range 返回一致）。
+            """
+            if range_limits is None:
+                range_limits = [self.rl, self.rh]
+
+            # 排除自身对象，防止与自己几何相交
+            other_objects = [obj for obj in object_list if obj.id != self.id]
+
+            # 收集其他机器人目标点坐标 (x, y)，仅在 filter_goal=True 时使用
+            other_robot_goals = []
+            if filter_goal:
+                for obj in env_param.objects:
+                    if obj.id == self.id or obj.role != "robot" or obj.goal is None:
+                        continue
+                    other_robot_goals.append(obj.goal[:2, 0].copy())
+
+            last_pos = None
+
+            for _ in range(max_attempts):
+                # 随机生成一个位置
+                pos = random_point_range(range_limits[0], range_limits[1])
+                last_pos = pos
+
+                # ---------- 几何碰撞检测 ----------
+                if free:
+                    shape = {"name": "circle", "radius": check_radius}
+                    gf = GeometryFactory.create_geometry(**shape)
+                    geometry = gf.step(np.c_[pos])
+
+                    collides = any(
+                        shapely.intersects(geometry, obj._geometry)
+                        for obj in other_objects
+                    )
+                    if collides:
+                        # 有碰撞，重新采样
+                        continue
+
+                # ---------- 与其他机器人目标点的距离约束 ----------
+                if filter_goal and other_robot_goals:
+                    pos_xy = np.array(pos[:2], dtype=float)
+                    near_other_goal = any(
+                        np.linalg.norm(pos_xy - goal_xy) < check_radius * 2.5
+                        for goal_xy in other_robot_goals
+                    )
+                    if near_other_goal:
+                        # 离其他 goal 过近，重新采样
+                        continue
+
+                # 两类约束都满足，返回该位置
+                return pos
+
+            # 超过最大尝试次数，返回最后一个采样点并给出警告
+            self.logger.warning(
+                f"在 {max_attempts} 次尝试内未能找到安全、无碰撞的可用位置，返回最后一次采样结果（可能与约束不完全满足）"
+            )
+            return last_pos
 
     def set_goal(
         self, goal: Optional[Union[list, np.ndarray]] = None, init: bool = False
