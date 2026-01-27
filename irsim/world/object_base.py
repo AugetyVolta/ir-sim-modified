@@ -914,10 +914,11 @@ class ObjectBase:
             self,
             object_list,
             free: bool = True,
-            filter_goal: bool = False,
+            filter_start_goal: bool = False,
             check_radius: float = 0.2,
             range_limits: Optional[list] = None,
             max_attempts: int = 200,
+            dis_tol : float = 1.0
         ):
             """
             在环境中随机采样无碰撞的位置，可作为起点或终点。
@@ -941,7 +942,8 @@ class ObjectBase:
                     若为 None，使用 self.rl, self.rh。
                 max_attempts:
                     采样最大尝试次数。
-
+                dis_tol:
+                    位置与其他机器人起点/目标点的最小距离阈值。
             返回：
                 position:
                     单个无碰撞的位置（格式与 random_point_range 返回一致）。
@@ -952,13 +954,14 @@ class ObjectBase:
             # 排除自身对象，防止与自己几何相交
             other_objects = [obj for obj in object_list if obj.id != self.id]
 
-            # 收集其他机器人目标点坐标 (x, y)，仅在 filter_goal=True 时使用
-            other_robot_goals = []
-            if filter_goal:
+            # 收集其他机器人起点/目标点坐标 (x, y)，仅在 filter_start_goal=True 时使用
+            other_robot_pos = []
+            if filter_start_goal:
                 for obj in env_param.objects:
-                    if obj.id == self.id or obj.role != "robot" or obj.goal is None:
+                    if obj.id == self.id or obj.role != "robot" or obj.position is None or obj.goal is None:
                         continue
-                    other_robot_goals.append(obj.goal[:2, 0].copy())
+                    other_robot_pos.append(obj.position[:2, 0].copy())
+                    other_robot_pos.append(obj.goal[:2, 0].copy())
 
             last_pos = None
 
@@ -982,13 +985,13 @@ class ObjectBase:
                         continue
 
                 # ---------- 与其他机器人目标点的距离约束 ----------
-                if filter_goal and other_robot_goals:
+                if filter_start_goal and other_robot_pos:
                     pos_xy = np.array(pos[:2], dtype=float)
-                    near_other_goal = any(
-                        np.linalg.norm(pos_xy - goal_xy) < check_radius * 2.5
-                        for goal_xy in other_robot_goals
+                    near_other_pos = any(
+                        np.linalg.norm(pos_xy - xy) < dis_tol
+                        for xy in other_robot_pos
                     )
-                    if near_other_goal:
+                    if near_other_pos:
                         # 离其他 goal 过近，重新采样
                         continue
 
